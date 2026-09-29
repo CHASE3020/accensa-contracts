@@ -124,6 +124,78 @@ fn two_merchants_get_distinct_salt_families() {
 }
 
 #[test]
+fn custom_salt_yields_deterministic_derived_address() {
+    let Ctx {
+        env,
+        factory,
+        merchant,
+        ..
+    } = setup();
+    let token = token_for(&env, &merchant);
+
+    let salt = BytesN::from_array(&env, &[0x42; 32]);
+    let expected = factory.compute_vault_address(&salt);
+
+    let a = factory.create_vault(
+        &vault_init(&env, &merchant, &token, 100),
+        &Some(salt.clone()),
+    );
+    assert_eq!(
+        a, expected,
+        "custom salt must reproduce the derived address"
+    );
+    assert_eq!(
+        factory.compute_vault_address(&salt),
+        expected,
+        "the derived address is deterministic"
+    );
+}
+
+#[test]
+fn reused_custom_salt_reverts_with_salt_collision() {
+    let Ctx {
+        env,
+        factory,
+        merchant,
+        ..
+    } = setup();
+    let token = token_for(&env, &merchant);
+
+    let salt = BytesN::from_array(&env, &[0x7f; 32]);
+    factory.create_vault(
+        &vault_init(&env, &merchant, &token, 100),
+        &Some(salt.clone()),
+    );
+
+    assert_eq!(
+        factory.try_create_vault(&vault_init(&env, &merchant, &token, 100), &Some(salt)),
+        Err(Ok(Error::SaltCollision))
+    );
+}
+
+#[test]
+fn custom_salt_is_distinct_from_counter_family() {
+    let Ctx {
+        env,
+        factory,
+        merchant,
+        ..
+    } = setup();
+    let token = token_for(&env, &merchant);
+
+    let custom = factory.create_vault(
+        &vault_init(&env, &merchant, &token, 100),
+        &Some(BytesN::from_array(&env, &[0x11; 32])),
+    );
+    let counted = factory.create_vault(&vault_init(&env, &merchant, &token, 100), &None);
+
+    assert_ne!(
+        custom, counted,
+        "custom salt must not alias the counter family"
+    );
+}
+
+#[test]
 fn factory_defaults_wire_policies_when_merchant_leaves_them_unset() {
     let Ctx {
         env,
@@ -279,7 +351,7 @@ fn deployed_vault_honors_window_via_factory_time_policy() {
         li.sequence_number = 50;
         li.timestamp = 50;
     });
-    client.refund(&payment_ref, &buyer, &100_000, &0, &100_000, &None);
+    client.refund(&payment_ref, &buyer, &100_000, &0, &100_000, &None, &0);
     assert!(client.get_refund(&payment_ref).is_some());
 }
 
@@ -303,7 +375,89 @@ fn deployed_vault_refuses_when_time_policy_unconfigured() {
     let payment_ref = BytesN::from_array(&env, &[9u8; 32]);
     let buyer = Address::generate(&env);
     assert_eq!(
-        client.try_refund(&payment_ref, &buyer, &100_000, &0, &100_000, &None),
+        client.try_refund(&payment_ref, &buyer, &100_000, &0, &100_000, &None, &0),
         Err(Ok(CommonError::PolicyContractsNotConfigured))
     );
+}
+
+// ── Protocol TVL (issue #464) ────────────────────────────────────────────
+
+#[test]
+fn get_tvl_is_zero_for_an_empty_factory() {
+    let Ctx {
+        env,
+        factory,
+        merchant,
+        ..
+    } = setup();
+    let token = token_for(&env, &merchant);
+
+    assert_eq!(factory.get_tvl(&token), 0);
+}
+
+#[test]
+fn get_tvl_sums_balances_of_multiple_funded_vaults() {
+    let Ctx {
+        env,
+        factory,
+        merchant,
+        ..
+    } = setup();
+    let token = token_for(&env, &merchant);
+    let sac = StellarAssetClient::new(&env, &token);
+
+    let a = factory.deploy_vault(&vault_init(&env, &merchant, &token, 0));
+    let b = factory.deploy_vault(&vault_init(&env, &merchant, &token, 0));
+    // Deployed but unfunded: must contribute nothing to the total.
+    let _c = factory.deploy_vault(&vault_init(&env, &merchant, &token, 0));
+
+    sac.mint(&a, &400_000);
+    sac.mint(&b, &600_000);
+
+    assert_eq!(factory.get_tvl(&token), 1_000_000);
+}
+
+#[test]
+fn get_tvl_only_counts_the_queried_asset() {
+    let Ctx {
+        env,
+        factory,
+        merchant,
+        ..
+    } = setup();
+    let usdc = token_for(&env, &merchant);
+    let other = token_for(&env, &Address::generate(&env));
+
+    let vault = factory.deploy_vault(&vault_init(&env, &merchant, &usdc, 0));
+    StellarAssetClient::new(&env, &usdc).mint(&vault, &250_000);
+
+    assert_eq!(factory.get_tvl(&usdc), 250_000);
+    assert_eq!(
+        factory.get_tvl(&other),
+        0,
+        "an asset no vault holds must not be counted"
+    );
+}
+
+#[test]
+fn get_tvl_drops_by_the_refunded_amount() {
+    let Ctx {
+        env,
+        factory,
+        merchant,
+        ..
+    } = setup();
+    let token = token_for(&env, &merchant);
+    StellarAssetClient::new(&env, &token).mint(&merchant, &FLOAT);
+
+    let vault = factory.deploy_vault(&vault_init(&env, &merchant, &token, 0));
+    let client = RefundVaultClient::new(&env, &vault);
+    client.deposit(&merchant, &FLOAT);
+    assert_eq!(factory.get_tvl(&token), FLOAT);
+
+    let buyer = Address::generate(&env);
+    let payment_ref = BytesN::from_array(&env, &[5u8; 32]);
+    client.refund(&payment_ref, &buyer, &100_000, &0, &100_000, &None, &0);
+
+    assert_eq!(factory.get_tvl(&token), FLOAT - 100_000);
 }

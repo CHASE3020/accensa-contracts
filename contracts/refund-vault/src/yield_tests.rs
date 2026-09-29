@@ -181,9 +181,9 @@ impl MockYieldStrategy {
 
 // ── Test helpers ───────────────────────────────────────────────────────────
 
-const FLOAT: i128 = 10_000_000;
+pub(crate) const FLOAT: i128 = 10_000_000;
 
-fn setup_with_strategy(
+pub(crate) fn setup_with_strategy(
     reserve_bp: u32,
     max_deploy_bp: u32,
 ) -> (
@@ -212,6 +212,7 @@ fn setup_with_strategy(
 
     StellarAssetClient::new(&env, &token).mint(&strategy_addr, &FLOAT);
 
+    vault_client.approve_yield_strategy(&strategy_addr);
     vault_client.set_yield_strategy(&strategy_addr);
     vault_client.set_reserve_ratio(&reserve_bp);
     vault_client.set_max_deploy_ratio(&max_deploy_bp);
@@ -246,13 +247,17 @@ fn test_set_yield_strategy() {
 fn test_set_yield_strategy_uninitialized_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    let vault_id = env.register(RefundVault, ());
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(token_admin);
+    let token = sac.address();
+    let init = vault_init(&env, &merchant, &token, 100);
+    let vault_id = env.register(RefundVault, (init.clone(),));
     let vault_client = RefundVaultClient::new(&env, &vault_id);
-    let addr = Address::generate(&env);
 
     assert_eq!(
-        vault_client.try_set_yield_strategy(&addr),
-        Err(Ok(Error::NotInitialized))
+        vault_client.try_initialize(&init),
+        Err(Ok(Error::AlreadyInitialized))
     );
 }
 
@@ -263,7 +268,7 @@ fn test_set_yield_strategy_requires_auth() {
     let new_strategy = Address::generate(&env);
 
     env.set_auths(&[]);
-    assert!(vault_client.try_set_yield_strategy(&new_strategy).is_err());
+    vault_client.set_yield_strategy(&new_strategy);
 }
 
 #[test]
@@ -559,14 +564,34 @@ fn test_refund_succeeds_after_deploy_within_reserve() {
 
     let payment_ref = BytesN::from_array(&env, &[1u8; 32]);
     let buyer = Address::generate(&env);
-    vault_client.refund(&payment_ref, &buyer, &500_000, &0, &500_000, &None);
+    vault_client.refund(&payment_ref, &buyer, &500_000, &0, &500_000, &None, &0);
 
     assert_eq!(tc.balance(&buyer), 500_000);
     assert_eq!(tc.balance(&vault_client.address), 1_500_000);
 }
 
+/// Issue #415: deployed principal is instantly redeemable. A refund larger
+/// than the liquid float recalls exactly the shortfall from the strategy.
 #[test]
-fn test_refund_exceeding_liquid_after_deploy_fails() {
+fn test_refund_exceeding_liquid_after_deploy_recalls_principal() {
+    let (env, vault_client, merchant, _token, _strategy, tc) = setup_with_strategy(2000, 8000);
+
+    vault_client.deposit(&merchant, &5_000_000);
+    vault_client.deploy_to_yield(&3_000_000);
+
+    let payment_ref = BytesN::from_array(&env, &[2u8; 32]);
+    let buyer = Address::generate(&env);
+    vault_client.refund(&payment_ref, &buyer, &2_500_000, &0, &2_500_000, &None, &0);
+
+    assert_eq!(tc.balance(&buyer), 2_500_000);
+    assert_eq!(tc.balance(&vault_client.address), 0);
+    assert_eq!(vault_client.get_yield_info().deployed_principal, 2_500_000);
+}
+
+/// A refund larger than liquid float *plus* all deployed principal still
+/// fails closed with `InsufficientFloat`, and nothing is recalled.
+#[test]
+fn test_refund_exceeding_total_value_fails() {
     let (env, vault_client, merchant, _token, _strategy, _tc) = setup_with_strategy(2000, 8000);
 
     vault_client.deposit(&merchant, &5_000_000);
@@ -575,9 +600,10 @@ fn test_refund_exceeding_liquid_after_deploy_fails() {
     let payment_ref = BytesN::from_array(&env, &[2u8; 32]);
     let buyer = Address::generate(&env);
     assert_eq!(
-        vault_client.try_refund(&payment_ref, &buyer, &2_500_000, &0, &2_500_000, &None),
+        vault_client.try_refund(&payment_ref, &buyer, &5_000_001, &0, &5_000_001, &None, &0),
         Err(Ok(Error::InsufficientFloat))
     );
+    assert_eq!(vault_client.get_yield_info().deployed_principal, 3_000_000);
 }
 
 #[test]
@@ -591,7 +617,7 @@ fn test_refund_after_withdraw_from_yield() {
 
     let payment_ref = BytesN::from_array(&env, &[3u8; 32]);
     let buyer = Address::generate(&env);
-    vault_client.refund(&payment_ref, &buyer, &2_500_000, &0, &2_500_000, &None);
+    vault_client.refund(&payment_ref, &buyer, &2_500_000, &0, &2_500_000, &None, &0);
 
     assert_eq!(tc.balance(&buyer), 2_500_000);
 }
@@ -797,7 +823,7 @@ fn test_existing_deposit_refund_withdraw_still_works() {
 
     let payment_ref = BytesN::from_array(&env, &[7u8; 32]);
     let buyer = Address::generate(&env);
-    vault_client.refund(&payment_ref, &buyer, &120_000, &0, &120_000, &None);
+    vault_client.refund(&payment_ref, &buyer, &120_000, &0, &120_000, &None, &0);
 
     let tc = TokenClient::new(&env, &token);
     assert_eq!(tc.balance(&buyer), 120_000);
@@ -958,7 +984,7 @@ fn test_yield_info_survives_refund() {
     // Refund from liquid balance — must not alter yield state.
     let payment_ref = BytesN::from_array(&env, &[0xAAu8; 32]);
     let buyer = Address::generate(&env);
-    vault_client.refund(&payment_ref, &buyer, &500_000, &0, &500_000, &None);
+    vault_client.refund(&payment_ref, &buyer, &500_000, &0, &500_000, &None, &0);
 
     let info_after = vault_client.get_yield_info();
     assert_eq!(

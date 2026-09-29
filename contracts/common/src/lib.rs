@@ -86,6 +86,11 @@ pub enum Error {
     AnchorRateLimited = 202,
     /// The supplied zero-knowledge validity proof is invalid or malformed.
     InvalidProof = 203,
+    /// A token-bucket rate-limit config was rejected: exactly one of
+    /// `burst_capacity` / `refill_interval_secs` was zero, or either exceeded
+    /// its cap (`MAX_RATE_BURST` / `MAX_RATE_REFILL_INTERVAL`). `{0, 0}`
+    /// disables rate limiting and is accepted.
+    InvalidRateLimitConfig = 204,
     /// No pending policy change exists to execute.
     NoPendingPolicy = 300,
     /// The timelock period has not yet elapsed.
@@ -131,6 +136,46 @@ pub enum Error {
     /// `migrate_state` was called with a target layout version that is not
     /// greater than the current storage version (or is otherwise invalid).
     InvalidMigrationVersion = 316,
+
+    // ── State channel errors (issue #134) ─────────────────────────────
+    /// The channel does not exist.
+    ChannelNotFound = 400,
+    /// The channel is not in the expected state for this operation.
+    ChannelNotOpen = 401,
+    /// The channel is already open or has already been finalized.
+    ChannelAlreadyClosed = 402,
+    /// The submitted state has a nonce less than or equal to the current one.
+    StaleState = 403,
+    /// The signature does not match the sender's public key.
+    InvalidSignature = 404,
+    /// The dispute challenge period has not yet expired.
+    ChallengeActive = 405,
+    /// The dispute challenge period has expired; funds can no longer be claimed
+    /// via dispute.
+    ChallengeExpired = 406,
+    /// The channel's escrowed balance is insufficient.
+    InsufficientChannelBalance = 407,
+    /// The timeout has already passed; the channel is expired.
+    ChannelExpired = 408,
+    /// A multi-asset state names a token the channel does not escrow, or
+    /// omits one it does (issue #423).
+    UnsupportedAsset = 409,
+    /// The referenced HTLC does not exist on the channel (issue #458).
+    HtlcNotFound = 410,
+    /// The HTLC is no longer pending (already resolved or refunded).
+    HtlcNotPending = 411,
+    /// The HTLC's timeout ledger has not yet passed, so it cannot be refunded.
+    HtlcNotExpired = 412,
+    /// The supplied preimage does not hash to the HTLC's hash lock.
+    InvalidPreimage = 413,
+    /// A downstream HTLC's timeout must be strictly smaller than its
+    /// upstream parent's (issue #458).
+    HtlcTimeoutOutOfOrder = 414,
+    /// The HTLC would reserve more than the channel's uncommitted escrow.
+    HtlcInsufficientEscrow = 415,
+    /// The HTLC's timeout ledger is already in the past, so it could never be
+    /// resolved before a refund (issue #458).
+    HtlcTimeoutElapsed = 416,
     /// A policy that requires the stateless policy contracts (time/VDF) was
     /// proposed or executed on a vault that was never wired with the contract
     /// addresses (issue #129: the factory wires them at construction, or the
@@ -140,6 +185,21 @@ pub enum Error {
     /// policy's schema (`TimePolicyParams` / `VdfPolicyParams`). Indicates a
     /// vault configured a policy entry against the wrong contract.
     InvalidPolicyParams = 318,
+    /// A refund/claim was submitted before the minimum cooldown elapsed.
+    ClaimCooldownNotElapsed = 320,
+    /// A checked arithmetic operation in a financial math helper over- or
+    /// under-flowed, a conversion would truncate, or a denominator was zero
+    /// (issue #396). The operation was refused *before* any state changed;
+    /// raw operators never run in the shared math helpers.
+    MathOverflow = 321,
+    /// The yield strategy is not on the vault's admin-approved whitelist
+    /// (issue #415).
+    StrategyNotApproved = 322,
+    /// The active yield strategy still holds deployed principal, so it cannot
+    /// be replaced or revoked until that principal is recalled (issue #415).
+    StrategyHasPrincipal = 323,
+    /// Explicit Soroban Host error mapping (issue #380).
+    HostError = 500,
 }
 
 /// Parameters for the stateless **time** policy contract (issue #129).
@@ -239,3 +299,13 @@ pub struct VaultInit {
     /// Mirror of the active VDF gate's delay (read path).
     pub vdf_delay: u32,
 }
+pub mod audit;
+pub mod blacklist;
+pub mod constant_time;
+pub mod events;
+pub mod math;
+pub mod nonce;
+pub mod reentrancy;
+pub mod storage;
+#[cfg(any(feature = "telemetry", test))]
+pub mod telemetry;

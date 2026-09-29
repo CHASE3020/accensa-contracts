@@ -4,7 +4,7 @@
   <p>
     <img src="https://img.shields.io/github/actions/workflow/status/accensa/accensa-contracts/ci.yml?branch=main" alt="CI Status" />
     <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License" />
-    <img src="https://img.shields.io/badge/soroban--sdk-27.0.4-orange.svg" alt="soroban-sdk 27" />
+    <img src="https://img.shields.io/badge/soroban--sdk-27.0.4-orange.svg" alt="soroban--sdk 27" />
     <img src="https://img.shields.io/badge/testnet-deployed-success.svg" alt="Deployed on testnet" />
   </p>
   <p>
@@ -27,28 +27,33 @@ x402 turns any HTTP endpoint into a paid resource: an AI agent hits your API, ge
 without recourse.
 
 **The agent cannot prove it was charged correctly.** Its receipt comes from the
-seller's own API, attesting to the seller's own behaviour. When an autonomous agent
-makes thousands of sub-cent calls a day across dozens of vendors, "trust the seller's
-dashboard" is not an auditing story. Any disagreement is unresolvable, because the
-only record is held by the party with an interest in it.
+seller's own API, attesting to payment without ledger backing. If the seller goes
+offline, ghosts a refund, or double-bills, the agent has no recourse.
 
-**The merchant cannot offer refunds without becoming a custodian.** Manual refunds
-don't scale to per-request payments, and an unbounded refund key over merchant float
-is exactly the thing a seller does not want sitting in a web backend.
+**The merchant has no liability cap.** Holding user float directly invites hacks
+and disputes.
 
-`accensa-contracts` fixes both on-chain. Receipts are anchored in Merkle batches that
-anyone can verify without asking the merchant. Refunds run through a vault with an
-enforced time window and double-refund protection, so the policy lives in the contract
-rather than in a support inbox.
+## The Solution
 
-Both contracts are **immutable**: they ship with no upgrade entry point and no
-`update_current_contract_wasm`, so once deployed, nobody — not even the merchant —
-can change the refund policy or how receipts verify. This is a deliberate security
-property (see [ADR 003](docs/ADR-003-upgradeability.md)); a logic change means a
-new contract ID and the migration procedure documented there.
+Accensa bridges x402 to Stellar via two Soroban smart contracts:
 
-## Why Stellar
+1. **ReceiptAnchor** — Merchants batch and anchor payment receipt roots on-chain using Merkle trees, giving agents verifiable proof of payment that survives server loss.
+2. **RefundVault** — A policy-bounded vault holding merchant float for automated refunds, restricted by time windows, balance limits, and merchant authorization.
 
+## Enforced Invariants & Test Coverage Mapping
+
+Enforced invariants, each covered by a test:
+
+- **No double refunds** — a `payment_ref` can only be refunded once (`AlreadyRefunded`).
+  *Mapped Test:* `contracts/refund-vault/src/test.rs` -> `test_double_refund_same_payment_ref_fails`
+- **Time-bounded** — refunds past `refund_window_ledgers` are rejected (`WindowExpired`).
+  *Mapped Test:* `contracts/refund-vault/src/test.rs` -> `test_refund_outside_window_fails`, `test_refund_at_window_boundary_succeeds`
+- **Float-bounded** — a refund can never exceed vault balance (`InsufficientFloat`).
+  *Mapped Test:* `contracts/refund-vault/src/test.rs` -> `test_refund_exceeding_float_fails`, `test_withdraw_exceeding_float_fails`
+- **Merchant-only** — every state-changing call requires merchant/admin auth (`Unauthorized`), with the explicit exception of `initialize` (which initializes the contract instance and does not require prior auth, see #145).
+  *Mapped Tests:* `contracts/refund-vault/src/test.rs` -> `test_refund_requires_merchant_auth`, `test_deposit_from_non_merchant_fails`, `test_pause_requires_merchant_auth`, `test_unpause_requires_merchant_auth`, `test_transfer_admin_requires_auth`, `test_cancel_admin_transfer_requires_auth`, `test_accept_admin_requires_pending_auth`; `contracts/receipt-anchor/src/test.rs` -> `test_anchor_batch_requires_merchant_auth`, `test_prune_batches_requires_admin_auth`
+- **Pausable** — operations are halted if the vault is paused (`Paused`).
+  *Mapped Test:* `contracts/refund-vault/src/test.rs` -> `test_refund_when_paused_fails`, `test_deposit_when_paused_fails`, `test_withdraw_when_paused_fails`
 This design is only economical on Stellar:
 
 - **Sub-cent fees make per-request payments viable at all.** x402 is about
@@ -67,30 +72,50 @@ This design is only economical on Stellar:
 Stores Merkle roots of batched payment receipts so agents can independently verify
 they were charged correctly, with no trusted API in the path.
 
+Receipts are partitioned into **logical shards**. Every batch-scoped call takes a
+leading `shard_id: u64`, and each `shard_id` owns a fully independent batch
+stream: its own `batch_id` sequence (starting at 1), its own duplicate-root
+check, its own historical root ring buffer, and its own prune cursor. This lets a
+merchant keep several concurrent Merkle roots live at once (per region, per asset
+type, per settlement pipeline) instead of serialising everything through one
+root. `shard_id` values are caller-chosen and need not be contiguous.
+
+Batch records themselves live in `ReceiptShard` **storage shards** that the anchor
+factory-deploys on demand — one per `SHARD_CAPACITY` (200) batches within a
+`shard_id`'s stream. The anchor is the router; it holds only the
+`(shard_id, capacity_index) -> Address` map.
+
 | Function | Purpose |
 |---|---|
-| `initialize(merchant)` | Binds the contract to a merchant admin address. |
-| `anchor_batch(root, count, period_start, period_end) -> u64` | Anchors a batch root, returns its `batch_id`. Merchant auth required. `count` must be $\le$ 1000 (`MAX_BATCH_SIZE`). Rate-limited if `min_anchor_interval > 0`. |
-| `anchor_batch_zk(state_root, proof, count, period_start, period_end) -> u64` | Anchors a batch by verifying a ZK validity proof of the batch state root. |
+| `initialize(merchant, shard_wasm_hash)` | Binds the contract to a merchant admin address and pins the `ReceiptShard` wasm hash used to deploy storage shards. |
+| `anchor_batch(shard_id, root, count, period_start, period_end) -> u64` | Anchors a batch root into `shard_id`'s stream, returns its `batch_id`. Merchant auth required. `count` must be $\le$ 1000 (`MAX_BATCH_SIZE`). Rejects `DuplicateRoot` if `root` equals that shard's latest root. Rate-limited if a rate limit is configured. |
+| `anchor_batch_zk(shard_id, state_root, proof, count, period_start, period_end) -> u64` | Anchors a batch into `shard_id`'s stream by verifying a ZK validity proof of the batch state root. |
 | `verify_zk_proof(proof, vk, public_inputs) -> bool` | Verifies a Groth16 zero-knowledge proof against public inputs in $O(1)$ time. |
-| `get_batch(batch_id) -> BatchRecord` | Reads an anchored batch. |
-| `get_batch_count() -> u64` | Returns the total number of anchored batches. Read-only. |
+| `get_batch(shard_id, batch_id) -> BatchRecord` | Reads an anchored batch from `shard_id`'s stream. |
+| `get_batch_count(shard_id) -> u64` | Returns the number of batches anchored for `shard_id`. `0` for an unused shard; `NotInitialized` before `initialize`. Read-only. |
 | `get_admin() -> Address` | Returns the configured merchant admin address. Read-only; fails with `NotInitialized` before `initialize`. |
-| `get_pruned_up_to() -> u64` | Returns the internal `PrunedUpTo` cursor: the lower bound of the pruned prefix. Read-only; fails with `NotInitialized` before `initialize`. |
+| `get_pruned_up_to(shard_id) -> u64` | Returns `shard_id`'s `ShardPrunedUpTo` cursor: the lower bound of that shard's pruned prefix. `1` for an unused shard; `NotInitialized` before `initialize`. Read-only. |
 | `get_max_batch_size() -> u32` | Returns `MAX_BATCH_SIZE` (currently 1000). Read-only; clients should discover the limit via this getter rather than hard-coding it. |
-| `set_min_anchor_interval(interval)` | Sets the minimum seconds between anchors (0 = disabled, max 86,400). Merchant auth required. |
-| `get_min_anchor_interval() -> u32` | Returns the current minimum anchor interval in seconds. Read-only. |
-| `verify_receipt(batch_id, leaf, proof) -> bool` | Verifies a receipt against the anchored root. Read-only, free to call. Returns `ProofTooLong` if the proof exceeds `MAX_PROOF_LEN` (10). |
-| `verify_receipt_by_root(root, leaf, proof) -> bool` | Verifies a receipt against any root in the historical ring buffer. Returns `ProofTooLong` if the proof exceeds `MAX_PROOF_LEN`. |
-| `get_root_buffer() -> Vec<BytesN<32>>` | Returns the current ring buffer of historical roots. Read-only. |
+| `set_anchor_rate_limit(burst_capacity, refill_interval_secs)` | Configures the token-bucket rate limit on `anchor_batch`. `{0, 0}` disables it. Merchant auth required. The limiter is global per merchant, not per shard. |
+| `get_anchor_rate_limit() -> RateLimitConfig` | Returns the current rate-limit config. Read-only. |
+| `verify_receipt(shard_id, batch_id, leaf, proof) -> bool` | Verifies a receipt against the root anchored at `batch_id` in `shard_id`'s stream. Read-only, free to call. Returns `ProofTooLong` if the proof exceeds `MAX_PROOF_LEN` (10). |
+| `verify_receipt_by_root(shard_id, root, leaf, proof) -> bool` | Verifies a receipt against any root in `shard_id`'s historical ring buffer. Root history is isolated per shard: a root anchored in one shard is not verifiable by root in another. Returns `ProofTooLong` if the proof exceeds `MAX_PROOF_LEN`. |
+| `get_root_buffer(shard_id) -> Vec<BytesN<32>>` | Returns `shard_id`'s ring buffer of historical roots. Read-only. |
 | `get_root_buffer_size() -> u32` | Returns `ROOT_BUFFER_SIZE` (currently 100). Read-only. |
+| `get_shard_root(shard_id) -> BytesN<32>` | Returns `shard_id`'s latest anchored root. `BatchNotFound` if that shard has anchored nothing. Read-only. |
+| `get_shard_ids() -> Vec<u64>` | Returns every `shard_id` that has anchored at least one batch, in first-use order. Read-only. |
+| `get_shard_capacity() -> u64` | Returns `SHARD_CAPACITY` (currently 200): batches per storage shard. Read-only. |
+| `get_shard_count(shard_id) -> u64` | Returns how many storage shards hold `shard_id`'s stream. Read-only. |
+| `get_shard_address(shard_id, shard_index) -> Address` | Returns the `ReceiptShard` contract holding `shard_id`'s `shard_index`-th capacity range. `BatchNotFound` if not yet deployed. Read-only. |
 | `get_max_proof_len() -> u32` | Returns `MAX_PROOF_LEN` (currently 10). Read-only; clients should discover the limit via this getter. |
-| `extend_batch_ttl(batch_id)` | Extends the TTL of a batch to prevent archival. Publicly callable. |
-| `prune_batches(before_ledger)` | Deletes anchored batches older than `before_ledger` to reclaim rent. Merchant auth required. |
+| `extend_batch_ttl(shard_id, batch_id)` | Extends the TTL of a batch to prevent archival. Publicly callable. |
+| `prune_batches(shard_id, before_ledger)` | Deletes `shard_id`'s anchored batches older than `before_ledger` to reclaim rent. Merchant auth required. |
 
-Pruning walks forward from an internal `PrunedUpTo` cursor and stops at the first batch
-that is not old enough, so the deleted range always stays a contiguous prefix — a batch
-is never removed from the middle while older ones remain readable.
+Pruning walks forward from `shard_id`'s own `ShardPrunedUpTo` cursor and stops at
+the first batch that is not old enough, so the deleted range always stays a
+contiguous prefix **within that shard** — a batch is never removed from the
+middle while older ones remain readable. Shards prune independently; pruning one
+shard never touches another.
 
 `MAX_BATCH_SIZE` (1000) caps how many receipts may appear in one `anchor_batch`. Call `get_max_batch_size` to discover the limit at runtime instead of hard-coding it.
 
@@ -98,11 +123,19 @@ Emits:
 
 | Event | Topics | Data |
 |---|---|---|
-| `AnchorEvent` | `("anchor_event", batch_id)` | `root`, `count`, `period_start`, `period_end` |
-| `PruneEvent` | `("prune_event", start_batch_id)` | `end_batch_id` |
+| `InitializedEvent` | `("initialized_event", merchant)` | `shard_wasm_hash`, `ledger` |
+| `Receipt` anchor action | `("receipt", "anchor", anchor_id)` | `schema_version`, `timestamp`, `root`, `shard_id`, `count`, `period_start`, `period_end`, `anchored_ledger` |
+| `Receipt` prune action | `("receipt", "prune", anchor_id)` | `schema_version`, `timestamp`, `shard_id`, `start_batch_id`, `end_batch_id` |
+| `ShardCreatedEvent` | `("shard_created_event", shard_id, shard_index)` | `shard_address`, `start_batch_id`, `end_batch_id` |
+| `RateLimitUpdatedEvent` | `("rate_limit_updated_event", previous_burst_capacity, previous_refill_interval_secs)` | `new_burst_capacity`, `new_refill_interval_secs`, `ledger` |
+| `AnchorIntervalUpdatedEvent` | `("anchor_interval_updated_event", previous_interval)` | `new_interval`, `ledger` |
 
 The `AnchorEvent` data map mirrors `BatchRecord`, so an indexer decodes it with the same
-shape `get_batch` returns.
+shape `get_batch` returns. Because `batch_id` is only unique within a `shard_id`,
+indexers must key on the `(shard_id, batch_id)` pair. `PruneEvent` is emitted only
+when a `prune_batches` call actually deletes batches (the closed range
+`[start_batch_id, end_batch_id]`). See
+[`docs/EVENTS.md`](docs/EVENTS.md) for the pinned topic tuples.
 
 Proofs use **sorted-pair SHA-256**: siblings are concatenated smaller-hash-first, so
 proofs carry no left/right position flags. The TypeScript SDK in
@@ -118,9 +151,9 @@ Holds merchant float and executes refunds bounded by an on-chain policy.
 |---|---|
 | `__constructor(VaultInit)` / `initialize(VaultInit)` | Constructor-wired initialization: sets admin (merchant), settlement token, policy addresses, fee, refund window, deadline, and VDF delay in one call. There is no post-deployment `initialize` window. |
 | `deposit(from, amount)` | Merchant tops up float. |
-| `refund(payment_ref, recipient, amount, paid_at_ledger, payment_amount, vdf_proof)` | Refunds part or all of a payment, subject to policy. `amount` is added to the cumulative total for `payment_ref`; `payment_amount` is the original payment amount and the hard ceiling on cumulative refunds. A configured fee (if any) is deducted before the payout. `vdf_proof` is `Option<BytesN<256>>` — the 128-byte output `x^(2^T) mod N` concatenated with the 128-byte Wesolowski witness — required only when the policy carries a VDF delay (see below). |
-| `claim_batch(claims)` | Refunds multiple claims in one transaction (`Vec<RefundClaim>`, one struct per `refund` call). Atomic: one failing claim reverts the whole batch. One merchant signature, one reentrancy lock, and a `RefundEvent` per claim. Per-element float checks mean it can never overdraw the vault. |
-| `process_batch(refunds)` | Best-effort batch refunds (`Vec<RefundParam>`, same shape as `RefundClaim`). Returns `Vec<bool>` — one entry per claim (`true` = applied), and a failing claim does **not** roll back the others. Capped at 100 claims per call (`BatchTooLarge`). Every claim runs the identical per-claim logic as `refund`, including the policy deadline check and the configured fee. Non-atomic by design: use `claim_batch` when all-or-nothing semantics are required. |
+| `refund(payment_ref, recipient, amount, paid_at_ledger, payment_amount, vdf_proof, nonce)` | Refunds part or all of a payment, subject to policy. `amount` is added to the cumulative total for `payment_ref`; `payment_amount` is the original payment amount and the hard ceiling on cumulative refunds. A configured fee (if any) is deducted before the payout. `vdf_proof` is `Option<BytesN<256>>` — the 128-byte output `x^(2^T) mod N` concatenated with the 128-byte Wesolowski witness — required only when the policy carries a VDF delay (see below). `nonce` is the caller's current per-user replay-protection nonce (issue #122); see [Security Model §Replay Attacks](docs/SECURITY_MODEL.md#replay-attacks). |
+| `claim_batch(claims, nonce)` | Refunds multiple claims in one transaction (`Vec<RefundClaim>`, one struct per `refund` call). Atomic: one failing claim reverts the whole batch. One merchant signature, one reentrancy lock, and a `RefundEvent` per claim. Per-element float checks mean it can never overdraw the vault. `nonce` is the caller's current per-user replay-protection nonce. |
+| `process_batch(refunds, nonce)` | Best-effort batch refunds (`Vec<RefundParam>`, same shape as `RefundClaim`). Returns `Vec<bool>` — one entry per claim (`true` = applied), and a failing claim does **not** roll back the others. Capped at 100 claims per call (`BatchTooLarge`). Every claim runs the identical per-claim logic as `refund`, including the policy deadline check and the configured fee. Non-atomic by design: use `claim_batch` when all-or-nothing semantics are required. An empty batch is a no-op that returns early and does **not** consume a nonce. |
 | `withdraw(amount, to)` | Merchant withdraws float. |
 | `propose_policy(ledgers, deadline, vdf_delay)` | Proposes a new refund policy — a window (in ledgers), a wall-clock deadline (Unix timestamp; `0` = no deadline), and a VDF delay in squarings (`0` = none); subject to timelock. |
 | `execute_policy()` | Executes a pending policy change after the timelock. Applies the new window, deadline, and VDF delay. |
@@ -134,6 +167,7 @@ Holds merchant float and executes refunds bounded by an on-chain policy.
 | `get_fee_bps()` | Returns the configured fee rate in basis points (read-only). |
 | `get_fee_recipient()` | Returns the configured fee recipient, if any (read-only; falls back to the merchant at claim time). |
 | `get_refund(payment_ref) -> Option<RefundRecord>` | Looks up a refund. |
+| `get_user_nonce(caller) -> u64` | Returns the caller's current replay-protection nonce (issue #122) — the `nonce` the caller's next `refund`/`claim_batch`/`process_batch` call must supply. Starts at `0`; increments on every successful claim call. |
 | `set_time_policy_contract(address)` | Wires (or clears) the stateless time-policy contract the vault delegates its window/deadline gate to. Merchant auth. |
 | `set_vdf_policy_contract(address)` | Wires (or clears) the stateless VDF-policy contract the vault delegates its proof gate to. Merchant auth. |
 | `get_time_policy_contract() / get_vdf_policy_contract() -> Option<Address>` | Returns the delegated policy contract addresses, if any. A `None` on an active gate means claims fail closed with `PolicyContractsNotConfigured`. |
@@ -232,6 +266,7 @@ Enforced invariants, each covered by a test:
   (`Unauthorized`); the admin may be a contract account (see
   [`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md#1-the-admin-merchant)).
 - **Pausable** — operations are halted if the vault is paused (`Paused`).
+- **Refund ceiling** — a refund for an `upto` payment cannot exceed the amount actually settled. Authorization caps are not refundable balances. Unsettled or expired authorizations cannot be refunded.
 
 **Dynamic (oracle-gated) policies** — beyond the static refund window, the
 merchant can install an `OraclePolicy` so refunds are only paid out while an
@@ -355,8 +390,12 @@ Note that `10`/`11` are deliberately unassigned (`MetadataTooLong` and
 (`AlreadyRefunded`) is reserved after the `RefundV2` migration — surviving codes
 keep their published values.
 
-## Storage Archival
+## Documentation
 
+- [Architecture Overview](docs/ARCHITECTURE.md)
+- [Security Model](docs/SECURITY_MODEL.md)
+- [Merkle Tree Structure](docs/ADR-001-merkle-structure.md)
+- [Deployments](DEPLOYMENTS.md)
 Soroban uses state archival to manage ledger bloat. The contracts are configured with a Time-To-Live (TTL) strategy that ensures active records remain in persistent storage for approximately 30 days (~518,400 ledgers) before they become eligible for archival.
 
 If a `BatchRecord` or `RefundRecord` is archived, it must be restored by submitting a restore transaction before it can be read again. Anyone can proactively prevent archival and reset the 30-day window by calling the public TTL extension functions:
@@ -512,4 +551,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Security policy in [SECURITY.md](SECURIT
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE) for details.

@@ -13,7 +13,7 @@ use soroban_sdk::{
 };
 
 /// A trivial admin-gated contract: `set_value` requires the stored admin's
-/// auth, exactly like `ReceiptAnchor::set_min_anchor_interval` requires its
+/// auth, exactly like `ReceiptAnchor::set_anchor_rate_limit` requires its
 /// merchant's. Used to prove `Governance::execute` can act as that admin.
 #[contract]
 struct Target;
@@ -55,9 +55,9 @@ struct Harness {
     m3: Address,
 }
 
-/// Three members weighted 1/1/2 (total 4), 6000 bps (60%) quorum, 100-ledger
-/// voting window. `m3` alone (weight 2) cannot pass; `m3` + either other
-/// member (weight 3) can.
+/// Three members with deposits 1/1/4 (quadratic weights 1/1/2, total 4),
+/// 6000 bps (60%) quorum, 100-ledger voting window. `m3` alone (weight 2)
+/// cannot pass; `m3` + either other member (weight 3) can.
 fn setup() -> Harness {
     let env = Env::default();
     env.mock_all_auths();
@@ -67,9 +67,9 @@ fn setup() -> Harness {
     let m3 = Address::generate(&env);
 
     let members = Vec::from_array(&env, [m1.clone(), m2.clone(), m3.clone()]);
-    let weights = Vec::from_array(&env, [1u64, 1u64, 2u64]);
+    let deposits = Vec::from_array(&env, [1u64, 1u64, 4u64]);
 
-    let gov_id = env.register(Governance, (members, weights, 6000u32, 100u32));
+    let gov_id = env.register(Governance, (members, deposits, 6000u32, 100u32));
     let gov = GovernanceClient::new(&env, &gov_id);
 
     let target_id = env.register(Target, ());
@@ -99,13 +99,13 @@ fn constructor_rejects_mismatched_lengths() {
     let env = Env::default();
     let m1 = Address::generate(&env);
     let members = Vec::from_array(&env, [m1]);
-    let weights = Vec::from_array(&env, [1u64, 2u64]);
+    let deposits = Vec::from_array(&env, [1u64, 2u64]);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        env.register(Governance, (members, weights, 5000u32, 10u32))
+        env.register(Governance, (members, deposits, 5000u32, 10u32))
     }));
     assert!(
         res.is_err(),
-        "mismatched members/weights must reject construction"
+        "mismatched members/deposits must reject construction"
     );
 }
 
@@ -114,9 +114,9 @@ fn constructor_rejects_zero_threshold() {
     let env = Env::default();
     let m1 = Address::generate(&env);
     let members = Vec::from_array(&env, [m1]);
-    let weights = Vec::from_array(&env, [1u64]);
+    let deposits = Vec::from_array(&env, [1u64]);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        env.register(Governance, (members, weights, 0u32, 10u32))
+        env.register(Governance, (members, deposits, 0u32, 10u32))
     }));
     assert!(res.is_err(), "a zero threshold must reject construction");
 }
@@ -126,9 +126,9 @@ fn constructor_rejects_zero_voting_period() {
     let env = Env::default();
     let m1 = Address::generate(&env);
     let members = Vec::from_array(&env, [m1]);
-    let weights = Vec::from_array(&env, [1u64]);
+    let deposits = Vec::from_array(&env, [1u64]);
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        env.register(Governance, (members, weights, 5000u32, 0u32))
+        env.register(Governance, (members, deposits, 5000u32, 0u32))
     }));
     assert!(
         res.is_err(),
@@ -219,6 +219,62 @@ fn no_votes_can_outweigh_a_stale_quorum() {
 }
 
 #[test]
+fn quorum_decays_linearly_over_the_voting_window() {
+    let h = setup();
+    let (target, function, args) = set_value_call(&h.env, &h.target, 1);
+    let id = h.gov.propose(&h.m1, &target, &function, &args);
+
+    // m3 alone: weight 2 of 4 = 50%. Initial quorum is 60%, so at the
+    // window's start this cannot pass...
+    h.gov.vote(&h.m3, &id, &true);
+    assert_eq!(h.gov.try_execute(&id), Err(Ok(Error::QuorumNotMet)));
+
+    // ...but by the midpoint (elapsed 50 of 100) the effective quorum has
+    // decayed to 47.5%, which m3's 50% now clears.
+    h.env.ledger().with_mut(|l| l.sequence_number += 50);
+    h.gov.execute(&id);
+}
+
+#[test]
+fn quorum_at_midpoint_is_lower_than_initial_but_above_floor() {
+    let h = setup();
+    let (target, function, args) = set_value_call(&h.env, &h.target, 1);
+    let id = h.gov.propose(&h.m1, &target, &function, &args);
+
+    h.gov.vote(&h.m3, &id, &true);
+
+    // Halfway through a 100-ledger window the effective quorum must sit
+    // strictly between 60% and the 35% floor.
+    h.env.ledger().with_mut(|l| l.sequence_number += 50);
+    let proposal = h.gov.get_proposal(&id);
+    let voting_period = h.gov.get_voting_period();
+    let now = h.env.ledger().sequence();
+    let elapsed = now - proposal.deadline_ledger.saturating_sub(voting_period);
+
+    assert_eq!(elapsed, 50);
+    // 50% < 60% but >= floor, so it must execute once decayed to midpoint.
+    h.gov.execute(&id);
+}
+
+#[test]
+fn quorum_floor_still_requires_real_opposition_is_outweighed() {
+    let h = setup();
+    let (target, function, args) = set_value_call(&h.env, &h.target, 1);
+    let id = h.gov.propose(&h.m1, &target, &function, &args);
+
+    // m3 (2) yes; m1 + m2 (2) no — even at the decayed floor, yes == no,
+    // so the proposal must still be rejected.
+    h.gov.vote(&h.m3, &id, &true);
+    h.gov.vote(&h.m1, &id, &false);
+    h.gov.vote(&h.m2, &id, &false);
+
+    h.env.ledger().with_mut(|l| l.sequence_number += 100);
+
+    let res = h.gov.try_execute(&id);
+    assert_eq!(res, Err(Ok(Error::QuorumNotMet)));
+}
+
+#[test]
 fn voting_closes_after_deadline() {
     let h = setup();
     let (target, function, args) = set_value_call(&h.env, &h.target, 1);
@@ -259,4 +315,38 @@ fn prune_succeeds_immediately_after_execution() {
     h.gov.prune_proposal(&id);
     let res = h.gov.try_get_proposal(&id);
     assert_eq!(res, Err(Ok(Error::ProposalNotFound)));
+}
+
+#[test]
+fn quadratic_weight_is_sqrt_of_deposit() {
+    let h = setup();
+    // m1 has deposit 1 -> quadratic weight = sqrt(1) = 1
+    // m2 has deposit 1 -> quadratic weight = sqrt(1) = 1
+    // m3 has deposit 4 -> quadratic weight = sqrt(4) = 2
+    assert_eq!(h.gov.get_member_weight(&h.m1), 1);
+    assert_eq!(h.gov.get_member_weight(&h.m2), 1);
+    assert_eq!(h.gov.get_member_weight(&h.m3), 2);
+    assert_eq!(h.gov.get_total_weight(), 4);
+}
+
+#[test]
+fn quadratic_weight_prevents_whale_domination() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+
+    // m1 deposits 100 tokens -> weight 10
+    // m2 deposits 10000 tokens -> weight 100
+    // With linear voting, m2 would have 100x more power
+    // With quadratic voting, m2 has only 10x more power
+    let members = Vec::from_array(&env, [m1.clone(), m2.clone()]);
+    let deposits = Vec::from_array(&env, [100u64, 10000u64]);
+    let gov_id = env.register(Governance, (members, deposits, 5000u32, 100u32));
+    let gov = GovernanceClient::new(&env, &gov_id);
+
+    assert_eq!(gov.get_member_weight(&m1), 10);
+    assert_eq!(gov.get_member_weight(&m2), 100);
+    assert_eq!(gov.get_total_weight(), 110);
 }

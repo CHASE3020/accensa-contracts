@@ -54,7 +54,7 @@ use soroban_sdk::{
 };
 
 use crate::test_helpers::vault_init;
-use crate::{DataKey, Error, RefundVault, RefundVaultClient};
+use crate::{Error, RefundVault, RefundVaultClient};
 
 const FLOAT: i128 = 1_000_000;
 
@@ -262,6 +262,7 @@ impl MaliciousToken {
                         &0,
                         &reentry_amount,
                         &None,
+                        &0,
                     ))
                 }
                 ReentrySelector::RefundOtherPaymentRef => {
@@ -272,6 +273,7 @@ impl MaliciousToken {
                         &0,
                         &reentry_amount,
                         &None,
+                        &0,
                     ))
                 }
                 ReentrySelector::Withdraw => {
@@ -362,7 +364,7 @@ fn test_reentrant_refund_same_payment_ref_is_blocked() {
         &amount,
     );
 
-    client.refund(&payment_ref, &buyer, &amount, &0, &amount, &None);
+    client.refund(&payment_ref, &buyer, &amount, &0, &amount, &None, &0);
 
     // The reentrant call never reached the vault's own code: the Soroban
     // host rejected it outright as a call-stack cycle.
@@ -404,7 +406,7 @@ fn test_reentrant_refund_other_payment_ref_is_blocked() {
         &amount,
     );
 
-    client.refund(&payment_ref, &buyer, &amount, &0, &amount, &None);
+    client.refund(&payment_ref, &buyer, &amount, &0, &amount, &None, &0);
 
     assert_eq!(token_client.last_result(), RESULT_HOST_BLOCKED);
     // The unrelated payment ref was never touched.
@@ -444,6 +446,7 @@ fn test_reentrant_withdraw_during_refund_is_blocked() {
         &0,
         &amount,
         &None,
+        &0,
     );
 
     assert_eq!(token_client.last_result(), RESULT_HOST_BLOCKED);
@@ -719,6 +722,7 @@ fn setup_with_malicious_strategy(
     // Fund the strategy so it can honor withdraw/harvest transfers back.
     StellarAssetClient::new(&env, &token).mint(&strategy_id, &YIELD_FLOAT);
 
+    vault_client.approve_yield_strategy(&strategy_id);
     vault_client.set_yield_strategy(&strategy_id);
     vault_client.set_reserve_ratio(&reserve_bp);
     vault_client.set_max_deploy_ratio(&max_deploy_bp);
@@ -798,7 +802,7 @@ fn test_reentrant_harvest_yield_is_blocked() {
 // flag already held — the same way an internal composition bug would (one
 // guarded function calling another directly in Rust, which the host cannot
 // see because no new contract invocation occurs). They call
-// `Env::as_contract` to write `DataKey::ReentrancyLock = true` into the
+// `Env::as_contract` to write `accensa_common::reentrancy::ReentrancyDataKey::Lock = true` into the
 // vault's own instance storage from outside, exactly mimicking "a guarded
 // call is already in progress", then confirm every guarded entry point
 // refuses to run.
@@ -826,7 +830,7 @@ fn hold_lock(env: &Env, vault_id: &Address) {
     env.as_contract(vault_id, || {
         env.storage()
             .instance()
-            .set(&DataKey::ReentrancyLock, &true);
+            .set(&accensa_common::reentrancy::ReentrancyDataKey::Lock, &true);
     });
 }
 
@@ -849,7 +853,7 @@ fn test_guard_blocks_refund_while_lock_held() {
     let payment_ref = BytesN::from_array(&env, &[20u8; 32]);
     let buyer = Address::generate(&env);
     assert_eq!(
-        client.try_refund(&payment_ref, &buyer, &1_000, &0, &1_000, &None),
+        client.try_refund(&payment_ref, &buyer, &1_000, &0, &1_000, &None, &0),
         Err(Ok(Error::ReentrancyBlocked))
     );
     assert!(client.get_refund(&payment_ref).is_none());
@@ -873,6 +877,7 @@ fn test_guard_blocks_deploy_to_yield_while_lock_held() {
     let strategy_id = env.register(crate::yield_tests::MockYieldStrategy, ());
     let strategy_client = crate::yield_tests::MockYieldStrategyClient::new(&env, &strategy_id);
     strategy_client.initialize(&token, &client.address);
+    client.approve_yield_strategy(&strategy_id);
     client.set_yield_strategy(&strategy_id);
     client.set_reserve_ratio(&0);
     client.set_max_deploy_ratio(&10_000);
@@ -893,9 +898,9 @@ fn test_lock_is_released_after_successful_call() {
     let ref_b = BytesN::from_array(&env, &[10u8; 32]);
     let buyer = Address::generate(&env);
 
-    client.refund(&ref_a, &buyer, &1_000, &0, &1_000, &None);
+    client.refund(&ref_a, &buyer, &1_000, &0, &1_000, &None, &0);
     // If the lock leaked as "held" from the first call, this would fail with
     // ReentrancyBlocked instead of succeeding.
-    client.refund(&ref_b, &buyer, &2_000, &0, &2_000, &None);
+    client.refund(&ref_b, &buyer, &2_000, &0, &2_000, &None, &1);
     client.withdraw(&500, &merchant);
 }
